@@ -12,9 +12,13 @@ In contrast, volatile memory needs constant power in order to retain data.
 #include <stdbool.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /*
 magic, version, pagesize, 
@@ -48,18 +52,28 @@ enum wal_record_type {
     WAL_RECORD_METADATA_UPDATE   // Metadata modification
 };
 
+// warning 
 struct wal_header {
     uint32_t magic;  
-    uint32_t version; 
+    uint32_t version;
+    // 8 bytes
+
+    uint32_t timeline_id; 
+    uint32_t page_size;          // (usually 4096)
+    // 8 bytes
+
     uint64_t last_lsn;           // Last Log Sequence Number
     uint64_t last_checkpoint_lsn;// LSN of last checkpoint
     uint64_t last_checkpoint_time;// Timestamp of last checkpoint
-    uint32_t page_size;          // (usually 4096)
+    // 32 bytes 
+
     uint32_t record_count; 
     uint32_t checksum; 
     uint32_t flags;              // WAL flags (e.g., dirty, clean)
-    uint8_t  reserved[32];       // Reserved for future use
+    uint8_t  reserved[28];       // Reserved for future use
+    // 16 bytes
 } __attribute__((packed));
+_Static_assert(sizeof(struct wal_header) == 80, "wal_header size changed!");
 
 struct wal_record_header {
     uint64_t lsn;                // Log Sequence Number (unique, increasing)
@@ -219,24 +233,41 @@ struct wal_checkpoint_payload {
     uint64_t free_memory;     
 };
 
-struct wal_record {
+// Отдельная структура для каждого типа записи
+struct wal_record_alloc {
     struct wal_record_header header;
+    struct wal_alloc_payload payload;
+};
 
-    struct wal_paylod {
-        struct wal_alloc_payload alloc;
-        struct wal_free_payload free;
-        struct wal_split_payload split;
-        struct wal_coalesce_payload coalesce;
-        struct wal_region_payload region;
-        struct wal_checkpoint_payload checkpoint;
-        uint8_t raw_data[WAL_MAX_RECORD_SIZE];
-    };
+struct wal_record_free {
+    struct wal_record_header header;
+    struct wal_free_payload payload;
+};
+
+struct wal_record_split {
+    struct wal_record_header header;
+    struct wal_split_payload payload;
+};
+
+struct wal_record_coalesce {
+    struct wal_record_header header;
+    struct wal_coalesce_payload payload;
+};
+
+struct wal_record_region {
+    struct wal_record_header header;
+    struct wal_region_payload payload;
+};
+
+struct wal_record_checkpoint {
+    struct wal_record_header header;
+    struct wal_checkpoint_payload payload;
 };
 
 // WAL FILE STRUCTURE
 struct wal_file {
     struct wal_header header;
-    struct wal_record records[];
+    struct wal_record_alloc records[];  // Just for example, actual file contains mixed records
 };
 
 // WAL BUFFER
@@ -265,6 +296,7 @@ struct wal_context {
     // Statistics
     uint64_t total_records_written;
     uint64_t total_records_flushed;
+    uint64_t total_sync_flushed;
     uint64_t total_bytes_written;
     uint64_t total_bytes_flushed;
     uint64_t total_flushes;
@@ -295,11 +327,6 @@ struct wal_operation {
     _Bool is_active;    
     _Bool needs_commit; 
 };
-
-static uint32_t crc32_table[256];
-static _Bool crc32_initialized = false;
-
-static const int CRC32_POLY = 0xEDB88320;
 
 static const uint32_t crc32_table[256] = {
     0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA,
@@ -457,7 +484,7 @@ crc >> 8 = 0x00FFFFFF
 }
 
 // --- util function ---
-static uint64_t get_nano_timestamp(void) {
+static uint64_t get_timestamp(void) {
     /*
     struct timespec {
            time_t     tv_sec;   /* Seconds  
@@ -465,7 +492,7 @@ static uint64_t get_nano_timestamp(void) {
        };
     */
     struct timespec ts;
-    smemset(&ts, 0, sizeof(ts));
+    memset(&ts, 0, sizeof(ts));
 
     /*
     int clock_gettime(clockid_t clockid, struct timespec *tp);
@@ -477,6 +504,17 @@ static uint64_t get_nano_timestamp(void) {
     */
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
+
+// ====================== FORWARD DECLARATIONS ======================
+static _Bool wal__flush_sync_locked(struct wal_context *ctx);
+static uint64_t wal__append_record_locked(struct wal_context *ctx,
+                                          uint32_t record_type,
+                                          const void *payload,
+                                          uint32_t payload_size);
+static uint64_t wal_append_record(struct wal_context *ctx,
+                                  uint32_t record_type,
+                                  const void *payload,
+                                  uint32_t payload_size);
 
 struct wal_context *wal_init(const char *wal_file_path) {
     if (!wal_file_path) return NULL;
@@ -495,7 +533,7 @@ struct wal_context *wal_init(const char *wal_file_path) {
     }
     
     ctx->buffer.buffer_size = WAL_DEFAULT_FILE_SIZE;
-    ctx->buffer.buffer = calloc(1, sizeof(ctx->buffer.buffer_size));
+    ctx->buffer.buffer = calloc(1, ctx->buffer.buffer_size);
     if (!ctx->buffer.buffer) {
         fprintf(stderr, "WAL: Failed to allocate buffer\n");
         free(ctx->wal_file_path);
@@ -515,8 +553,6 @@ struct wal_context *wal_init(const char *wal_file_path) {
     ctx->transaction_id = 1;
     ctx->in_recovery = false;
     ctx->recovery_errors = 0;
-    
-    crc32_init();
     
     return ctx;
 }
@@ -543,7 +579,7 @@ _Bool wal_open(struct wal_context *ctx) {
     }
 
     struct stat st;
-    smemset(&st, 0, sizeof(st));
+    memset(&st, 0, sizeof(st));
     
     /*
     stat and fstat are system functions used to retrieve metadata about a file, such as its size, permissions, and creation time. They do not read the content of the file, only its details.
@@ -552,7 +588,7 @@ _Bool wal_open(struct wal_context *ctx) {
     */
     if (fstat(ctx->wal_file_fd, &st) == 0 && st.st_size > 0) {
         struct wal_header header;
-        smemset(&header, 0, sizeof(header));
+        memset(&header, 0, sizeof(header));
 
         /*
         pread, pwrite - read from or write to a file descriptor at a given
@@ -585,9 +621,13 @@ _Bool wal_open(struct wal_context *ctx) {
         ctx->last_lsn = header.last_lsn;
         ctx->last_checkpoint_lsn = header.last_checkpoint_lsn;
         ctx->buffer.current_offset = sizeof(struct wal_header);
+
+        // ВАЖНО: без этих двух строк первый flush запишет данные поверх старых
+        ctx->total_bytes_flushed = (uint64_t)st.st_size - sizeof(struct wal_header);
+        ctx->last_flushed_lsn = header.last_lsn;
     } else {
         struct wal_header header;
-        smemset(&header, 0, sizeof(header));
+        memset(&header, 0, sizeof(header));
 
         header.magic = WAL_MAGIC_NUMBER;
         header.version = WAL_VERSION;
@@ -618,100 +658,115 @@ _Bool wal_open(struct wal_context *ctx) {
     return true;
 }
 
-/*
-record:
-block1 
-block2
-...
-*/
-static uint64_t wal_append_record(struct wal_context *ctx, uint32_t record_type, const void *payload, uint32_t payload_size) {
-    if (!ctx || !ctx->is_open) return 0;
-
-    pthread_mutex_lock(&ctx->wal_lock);
+static uint64_t wal__append_record_locked(struct wal_context *ctx, uint32_t record_type, const void *payload, uint32_t payload_size) {
+    if (!ctx || !ctx->is_open) {
+        return 0;
+    }
 
     uint32_t record_size = sizeof(struct wal_record_header) + payload_size;
 
+    if (payload_size > WAL_MAX_RECORD_SIZE - sizeof(struct wal_record_header)) {
+        fprintf(stderr, "WAL: payload too large\n");
+        return 0;
+    }
+
     /*
-    if buffer is full -> flush
+    if buffer is full -> flush 
     */
     if (ctx->buffer.current_offset + record_size > ctx->buffer.buffer_size) {
-        if (ctx->buffer.current_offset > sizeof(struct wal_header)) {
-            size_t bytes_to_write = ctx->buffer.current_offset - sizeof(struct wal_header);
-            /*
-            off_t is used for describing file sizes. It is a signed integer type.
-            */
-            off_t file_offset = sizeof(struct wal_header) + ctx->total_bytes_written;
-
-            /*
-            ssize_t pwrite(size_t count;
-                     int fd, const void buf[count], size_t count,
-                     off_t offset);
-            */
-            ssize_t written = pwrite(ctx->wal_file_fd, ctx->buffer.buffer + sizeof(struct wal_header), bytes_to_write, file_offset);
-
-            if (written == (ssize_t)bytes_to_write) {
-                ctx->total_flushes++;
-                ctx->total_bytes_written += written;
-                ctx->last_flushed_lsn = ctx->last_lsn;
-
-                ctx->buffer.current_offset = sizeof(struct wal_header);
-            } else if (written < 0) {
-                perror("WAL pwrite failed");
-                return 0;
-            } else {
-                fprintf(stderr, "CRITICAL: WAL partial write occurred (%ld of %zu bytes)\n", written, bytes_to_write);
-                return 0;
-            }
+        if (!wal__flush_sync_locked(ctx)) {
+            fprintf(stderr, "WAL: Failed to flush before appending new record\n");
+            return 0;
         }
-        // ctx->buffer.current_offset = sizeof(struct wal_header);
+    }
+
+    /*
+    Проверка: одна запись должна помещаться в пустой буфер
+    Иначе memcpy переполнит буфер
+    */
+    if (record_size > ctx->buffer.buffer_size - sizeof(struct wal_header)) {
+        fprintf(stderr, "WAL: Record too large (%u bytes, buffer %zu bytes)\n",
+                record_size, ctx->buffer.buffer_size - sizeof(struct wal_header));
+        return 0;
     }
 
     struct wal_record_header record_header;
-    smemset(&record_header, 0, sizeof(record_header));
+    memset(&record_header, 0, sizeof(record_header));
 
     ctx->last_lsn++;
     record_header.lsn = ctx->last_lsn;
+    /*
+    if LSN started with 0, then the prev_lsn of the first entry would be -1, which for uint64_t would give a huge number 0xFFFFFFFFFFFFFFFF. 
+    LSN usually starts with 1 (just so that 0 means "there is no previous one"). It is worth checking the initialization of ctx->last_lsn in the context creation code.
+    */
     record_header.prev_lsn = ctx->last_lsn - 1;
     record_header.transaction_id = ctx->transaction_id;
-    record_header.record_type = record_type;
     record_header.record_size = record_size;
+    record_header.record_type = record_type;
     record_header.data_size = payload_size;
     record_header.flags = 0;
     record_header.timestamp = get_timestamp();
+    // record_header.crc32 = 0;
 
-    memcpy(ctx->buffer.buffer + ctx->buffer.current_offset, 
-           &record_header, sizeof(record_header));
+    size_t record_start = ctx->buffer.current_offset;
+    /*
+    void *memcpy(size_t n;
+                    void dest[restrict n], const void src[restrict n],
+                    size_t n);
+
+    memcpy(buf + off, src, n);
+    off += n;
+    */
+    memcpy(ctx->buffer.buffer + ctx->buffer.current_offset, &record_header, sizeof(record_header));
     ctx->buffer.current_offset += sizeof(record_header);
-    
-    // Write payload
-    if (payload && payload_size > 0) {
-        memcpy(ctx->buffer.buffer + ctx->buffer.current_offset,
-               payload, payload_size);
+
+    if (payload_size > 0) {
+        if (payload) {
+            memcpy(ctx->buffer.buffer + ctx->buffer.current_offset,
+                   payload, payload_size);
+        } else {
+            /* payload == NULL, but size > 0: zeroing,
+               чтобы CRC был детерминированным */
+            memset(ctx->buffer.buffer + ctx->buffer.current_offset,
+                   0, payload_size);
+        }
         ctx->buffer.current_offset += payload_size;
     }
-    
-    // Calculate CRC
-    uint32_t crc = crc32_calculate(ctx->buffer.buffer + 
-                                    ctx->buffer.current_offset - record_size,
-                                    record_size - sizeof(uint32_t));
-    
-    // Write CRC
-    memcpy(ctx->buffer.buffer + ctx->buffer.current_offset - sizeof(uint32_t),
-           &crc, sizeof(crc));
-    
+
+    /*
+    static uint32_t crc32_calculate(const void *data, size_t size)
+    */
+    uint32_t crc = crc32_calculate(ctx->buffer.buffer + record_start, record_size);
+
+    struct wal_record_header *hdr_in_buf =
+        (struct wal_record_header *)(ctx->buffer.buffer + record_start);
+    hdr_in_buf->crc32 = crc;
+
     ctx->total_records_written++;
     ctx->total_bytes_written += record_size;
-    
-    uint64_t lsn = record_header.lsn;
-    
+
+    return record_header.lsn;
+}
+
+// ====================== PUBLIC WRAPPER FOR APPEND ======================
+static uint64_t wal_append_record(struct wal_context *ctx,
+                                  uint32_t record_type,
+                                  const void *payload,
+                                  uint32_t payload_size) {
+    if (!ctx || !ctx->is_open) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&ctx->wal_lock);
+    uint64_t lsn = wal__append_record_locked(ctx, record_type, payload, payload_size);
     pthread_mutex_unlock(&ctx->wal_lock);
-    
-    return lsn;    
+
+    return lsn;
 }
 
 uint64_t wal_write_alloc(struct wal_context *ctx, void *user_ptr, void *block_ptr, uint64_t region_id, uint32_t block_size, uint32_t class_index) {
     struct wal_alloc_payload payload;
-    smemset(&payload, 0, sizeof(payload));
+    memset(&payload, 0, sizeof(payload));
 
     payload.user_ptr = user_ptr;
     payload.block_ptr = block_ptr;
@@ -728,7 +783,7 @@ uint64_t wal_write_free(struct wal_context *ctx, void *user_ptr,
                         void *block_ptr, uint64_t region_id,
                         uint32_t block_size) {
     struct wal_free_payload payload;
-    smemset(&payload, 0, sizeof(payload));
+    memset(&payload, 0, sizeof(payload));
     
     payload.user_ptr = user_ptr;
     payload.block_ptr = block_ptr;
@@ -744,7 +799,7 @@ uint64_t wal_write_split(struct wal_context *ctx, void *original_block,
                          void *new_block, uint32_t original_size,
                          uint32_t new_size, uint32_t remaining_size) {
     struct wal_split_payload payload;
-    smemset(&payload, 0, sizeof(payload));
+    memset(&payload, 0, sizeof(payload));
     
     payload.original_block = original_block;
     payload.new_block = new_block;
@@ -759,7 +814,7 @@ uint64_t wal_write_coalesce(struct wal_context *ctx, void *block1,
                             void *block2, uint32_t block1_size,
                             uint32_t block2_size, uint32_t coalesced_size) {
     struct wal_coalesce_payload payload;
-    smemset(&payload, 0, sizeof(payload));
+    memset(&payload, 0, sizeof(payload));
     
     payload.block1 = block1;
     payload.block2 = block2;
@@ -774,7 +829,7 @@ uint64_t wal_write_region(struct wal_context *ctx, void *region_base,
                           uint32_t region_id, uint32_t region_size,
                           uint32_t canary) {
     struct wal_region_payload payload;
-    smemset(&payload, 0, sizeof(payload));
+    memset(&payload, 0, sizeof(payload));
     
     payload.region_base = region_base;
     payload.region_id = region_id;
@@ -787,7 +842,7 @@ uint64_t wal_write_region(struct wal_context *ctx, void *region_base,
 
 uint64_t wal_write_checkpoint(struct wal_context *ctx) {
     struct wal_checkpoint_payload payload;
-    smemset(&payload, 0, sizeof(payload));
+    memset(&payload, 0, sizeof(payload));
     
     payload.checkpoint_lsn = ctx->last_lsn;
     payload.total_regions = 0;
@@ -798,3 +853,391 @@ uint64_t wal_write_checkpoint(struct wal_context *ctx) {
     
     return wal_append_record(ctx, WAL_RECORD_CHECKPOINT, &payload, sizeof(payload));
 }
+
+// _Bool wal_flush_async(struct wal_context *ctx) {
+//     if (!ctx || !ctx->is_open) return false;
+
+//     pthread_mutex_lock(&ctx->wal_lock);
+
+//     if (ctx->buffer.current_offset <= sizeof(struct wal_header)) {
+//         pthread_mutex_unlock(&ctx->wal_lock);
+//         return true; // empty
+//     }
+
+//     size_t bytes_to_write = ctx->buffer.current_offset - sizeof(struct wal_header);
+//     ssize_t bytes_written = pwrite(ctx->wal_file_fd, 
+//                                    ctx->buffer.buffer + sizeof(struct wal_header), 
+//                                    bytes_to_write, 
+//                                    sizeof(struct wal_header) + ctx->total_bytes_flushed);
+
+//     if (bytes_written != (ssize_t)bytes_to_write) {
+//         fprintf(stderr, "WAL: Async flush failed\n");
+//         pthread_mutex_unlock(&ctx->wal_lock);
+//         return false;
+//     }
+
+//     ctx->total_flushes++;
+//     ctx->total_bytes_flushed += bytes_written;
+//     // last write
+//     ctx->last_flushed_lsn = ctx->last_lsn;
+//     // clean buffer for new records
+//     ctx->buffer.current_offset = sizeof(struct wal_header);
+
+//     if (ctx->on_flush) {
+//         ctx->on_flush(ctx->callback_ctx);
+//     }
+
+//     pthread_mutex_unlock(&ctx->wal_lock);
+//     return true;
+// }
+
+static _Bool wal__flush_sync_locked(struct wal_context *ctx) {
+    if (!ctx || !ctx->is_open || ctx->wal_file_fd < 0) {
+        return false;
+    }
+
+    if (ctx->buffer.current_offset <= sizeof(struct wal_header)) {
+        return true; // empty
+    }
+
+    size_t bytes_to_write = ctx->buffer.current_offset - sizeof(struct wal_header);
+    off_t offset = (off_t)(sizeof(struct wal_header) + ctx->total_bytes_flushed);
+    ssize_t bytes_written = pwrite(ctx->wal_file_fd,
+                               ctx->buffer.buffer + sizeof(struct wal_header),
+                               bytes_to_write,
+                               offset);
+
+    if (bytes_written < 0) {
+        fprintf(stderr, "WAL: pwrite failed: %s\n", strerror(errno));
+        return false;
+    }
+    
+    if ((size_t)bytes_written < bytes_to_write) {
+        size_t remaining = bytes_to_write - bytes_written;
+        /* 
+        void *memmove(size_t n;
+                      void dest[n], const void src[n], size_t n);
+        */
+        memmove(ctx->buffer.buffer + sizeof(struct wal_header), ctx->buffer.buffer + sizeof(struct wal_header) + bytes_written, remaining);
+        ctx->buffer.current_offset = sizeof(struct wal_header) + remaining;
+        ctx->total_bytes_flushed += bytes_written;
+        fprintf(stderr, "WAL: Partial write, %zu bytes remaining\n", remaining);
+
+        return false;
+    }
+
+    /*
+    fsync() is a POSIX system call that forces the operating system to flush all modified data and metadata associated with a specific file descriptor directly to persistent storage
+    
+    It blocks execution and does not return to the application until the underlying storage hardware acknowledges that the data has been safely written.
+    */
+    if (fsync(ctx->wal_file_fd) != 0) {
+        fprintf(stderr, "WAL: fsync failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    ctx->total_flushes++;
+    ctx->total_sync_flushed++;
+    ctx->total_bytes_flushed += bytes_written;
+    ctx->last_flushed_lsn = ctx->last_lsn;
+    ctx->buffer.current_offset = sizeof(struct wal_header);
+
+    return true;
+}
+
+_Bool wal_flush_sync(struct wal_context *ctx) {
+    if (!ctx || !ctx->is_open) {
+        return false;
+    }
+
+    pthread_mutex_lock(&ctx->wal_lock);
+    _Bool ok = wal__flush_sync_locked(ctx);
+    pthread_mutex_unlock(&ctx->wal_lock);
+
+    if (ok && ctx->on_flush) {
+        ctx->on_flush(ctx->callback_ctx);
+    }
+
+    return ok;
+}
+
+_Bool wal_checkpoint(struct wal_context *ctx, _Bool flush_first) {
+    if (!ctx || !ctx->is_open) return false;
+
+    pthread_mutex_lock(&ctx->wal_lock);
+
+    if (flush_first) {
+        if (!wal__flush_sync_locked(ctx)) {
+            pthread_mutex_unlock(&ctx->wal_lock);
+            return false;
+        }
+    }
+
+    // Write checkpoint record
+    struct wal_checkpoint_payload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.checkpoint_lsn = ctx->last_lsn;
+
+    uint64_t lsn = wal__append_record_locked(ctx, WAL_RECORD_CHECKPOINT,
+                                             &payload, sizeof(payload));
+    if (lsn == 0) {
+        pthread_mutex_unlock(&ctx->wal_lock);
+        return false;
+    }
+
+    // Сбрасываем checkpoint-запись на диск
+    if (!wal__flush_sync_locked(ctx)) {
+        pthread_mutex_unlock(&ctx->wal_lock);
+        return false;
+    }
+
+    // Update header
+    struct wal_header header;
+    memset(&header, 0, sizeof(header));
+    
+    header.magic = WAL_MAGIC_NUMBER;
+    header.version = WAL_VERSION;
+    header.last_lsn = ctx->last_lsn;
+    header.last_checkpoint_lsn = ctx->last_lsn;
+    header.last_checkpoint_time = get_timestamp();
+    header.page_size = WAL_PAGE_SIZE;
+    header.record_count = ctx->total_records_written;
+    header.flags = 0;
+    
+    if (pwrite(ctx->wal_file_fd, &header, sizeof(header), 0) != sizeof(header)) {
+        fprintf(stderr, "WAL: Failed to update header in checkpoint\n");
+        pthread_mutex_unlock(&ctx->wal_lock);
+        return false;
+    }
+    fsync(ctx->wal_file_fd);
+    
+    ctx->last_checkpoint_lsn = ctx->last_lsn;
+    ctx->total_checkpoints++;
+
+    // Сохраняем callback и ctx для вызова вне блокировки
+    void *cb_ctx = ctx->callback_ctx;
+    void (*cb)(void *) = ctx->on_checkpoint;
+
+    pthread_mutex_unlock(&ctx->wal_lock);
+
+    if (cb) {
+        cb(cb_ctx);
+    }
+    
+    return true;
+}
+
+_Bool wal_recovery(struct wal_context *ctx) {
+    if (!ctx || !ctx->is_open) return false;
+    
+    pthread_mutex_lock(&ctx->wal_lock);
+    ctx->in_recovery = true;
+    
+    printf("WAL: Starting recovery...\n");
+
+    if (ctx->on_recovery) {
+        ctx->on_recovery(ctx->callback_ctx);
+    }
+    
+    // Read header
+    struct wal_header header;
+    ssize_t bytes_read = pread(ctx->wal_file_fd, &header, sizeof(header), 0);
+    
+    if (bytes_read != sizeof(header)) {
+        fprintf(stderr, "WAL: Failed to read header\n");
+        ctx->in_recovery = false;
+        pthread_mutex_unlock(&ctx->wal_lock);
+        return false;
+    }
+    
+    if (header.magic != WAL_MAGIC_NUMBER) {
+        fprintf(stderr, "WAL: Invalid magic number\n");
+        ctx->in_recovery = false;
+        pthread_mutex_unlock(&ctx->wal_lock);
+        return false;
+    }
+    
+    printf("WAL: Last LSN: %llu, Checkpoint LSN: %llu\n",
+           (unsigned long long)header.last_lsn,
+           (unsigned long long)header.last_checkpoint_lsn);
+    
+    ctx->last_lsn = header.last_lsn;
+    ctx->last_checkpoint_lsn = header.last_checkpoint_lsn;
+    
+    ctx->in_recovery = false;
+    pthread_mutex_unlock(&ctx->wal_lock);
+    
+    return true;
+}
+
+void wal_close(struct wal_context *ctx) {
+    if (!ctx) return;
+    
+    pthread_mutex_lock(&ctx->wal_lock);
+    
+    if (ctx->is_open) {
+        // БЕЗ deadlock — используем locked-версию
+        wal__flush_sync_locked(ctx);
+        
+        // Update header
+        struct wal_header header;
+        memset(&header, 0, sizeof(header));
+        
+        header.magic = WAL_MAGIC_NUMBER;
+        header.version = WAL_VERSION;
+        header.last_lsn = ctx->last_lsn;
+        header.last_checkpoint_lsn = ctx->last_checkpoint_lsn;
+        header.last_checkpoint_time = get_timestamp();
+        header.page_size = WAL_PAGE_SIZE;
+        header.record_count = ctx->total_records_written;
+        header.flags = 0;
+        
+        pwrite(ctx->wal_file_fd, &header, sizeof(header), 0);
+        fsync(ctx->wal_file_fd);
+        
+        close(ctx->wal_file_fd);
+        ctx->wal_file_fd = -1;
+        ctx->is_open = false;
+    }
+    
+    pthread_mutex_unlock(&ctx->wal_lock);
+}
+
+void wal_destroy(struct wal_context *ctx) {
+    if (!ctx) return;
+    
+    wal_close(ctx);
+    
+    pthread_mutex_destroy(&ctx->wal_lock);
+    pthread_mutex_destroy(&ctx->buffer.buffer_lock);
+    pthread_cond_destroy(&ctx->flush_cond);
+    
+    free(ctx->buffer.buffer);
+    free(ctx->wal_file_path);
+    free(ctx);
+}
+
+void wal_print_stats(struct wal_context *ctx) {
+    if (!ctx) return;
+    
+    pthread_mutex_lock(&ctx->wal_lock);
+    
+    printf("\n=== WAL Statistics ===\n");
+    printf("File: %s\n", ctx->wal_file_path);
+    printf("Open: %s\n", ctx->is_open ? "Yes" : "No");
+    printf("Last LSN: %llu\n", (unsigned long long)ctx->last_lsn);
+    printf("Last Flushed LSN: %llu\n", (unsigned long long)ctx->last_flushed_lsn);
+    printf("Last Checkpoint LSN: %llu\n", (unsigned long long)ctx->last_checkpoint_lsn);
+    printf("Buffer Used: %zu / %zu bytes\n", 
+           ctx->buffer.current_offset, ctx->buffer.buffer_size);
+    printf("Total Records Written: %llu\n", 
+           (unsigned long long)ctx->total_records_written);
+    printf("Total Bytes Written: %llu\n", 
+           (unsigned long long)ctx->total_bytes_written);
+    printf("Total Flushes: %llu\n", 
+           (unsigned long long)ctx->total_flushes);
+    printf("Total Sync Flushes: %llu\n", 
+           (unsigned long long)ctx->total_sync_flushed);
+    printf("Total Checkpoints: %llu\n", 
+           (unsigned long long)ctx->total_checkpoints);
+    printf("Recovery Errors: %u\n", ctx->recovery_errors);
+    
+    pthread_mutex_unlock(&ctx->wal_lock);
+}
+
+// ====================== TEST MAIN ======================
+#ifdef WAL_TEST
+int main(void) {
+    const char *path = "/tmp/test_wal.log";
+
+    // Удаляем старый файл, чтобы тест был чистым
+    unlink(path);
+
+    printf("=== WAL TEST START ===\n\n");
+
+    // 1. Инициализация
+    struct wal_context *wal = wal_init(path);
+    if (!wal) {
+        fprintf(stderr, "wal_init failed\n");
+        return 1;
+    }
+
+    // 2. Открытие
+    if (!wal_open(wal)) {
+        fprintf(stderr, "wal_open failed\n");
+        wal_destroy(wal);
+        return 1;
+    }
+
+    printf("[OK] WAL opened: %s\n\n", path);
+
+    // 3. Запись alloc
+    void *fake_ptr1 = (void *)0x1000;
+    void *fake_ptr2 = (void *)0x2000;
+
+    uint64_t lsn1 = wal_write_alloc(wal, fake_ptr1, fake_ptr1, 1, 32, 0);
+    printf("[OK] wal_write_alloc #1 -> LSN %llu\n", (unsigned long long)lsn1);
+
+    uint64_t lsn2 = wal_write_alloc(wal, fake_ptr2, fake_ptr2, 1, 64, 1);
+    printf("[OK] wal_write_alloc #2 -> LSN %llu\n", (unsigned long long)lsn2);
+
+    // 4. Запись free
+    uint64_t lsn3 = wal_write_free(wal, fake_ptr1, fake_ptr1, 1, 32);
+    printf("[OK] wal_write_free  #1 -> LSN %llu\n", (unsigned long long)lsn3);
+
+    // 5. Запись region
+    uint64_t lsn4 = wal_write_region(wal, (void *)0x100000, 1, 2*1024*1024, 0xDEADBEEF);
+    printf("[OK] wal_write_region -> LSN %llu\n", (unsigned long long)lsn4);
+
+    // 6. Flush (синхронный)
+    if (!wal_flush_sync(wal)) {
+        fprintf(stderr, "wal_flush_sync failed\n");
+        wal_destroy(wal);
+        return 1;
+    }
+    printf("[OK] wal_flush_sync done\n\n");
+
+    // 7. Checkpoint
+    if (!wal_checkpoint(wal, true)) {
+        fprintf(stderr, "wal_checkpoint failed\n");
+        wal_destroy(wal);
+        return 1;
+    }
+    printf("[OK] wal_checkpoint done\n\n");
+
+    // 8. Статистика
+    wal_print_stats(wal);
+
+    // 9. Закрытие
+    wal_close(wal);
+    printf("\n[OK] WAL closed\n");
+
+    // 10. Открываем заново — проверяем, что заголовок читается
+    printf("\n=== REOPEN TEST ===\n");
+    if (!wal_open(wal)) {
+        fprintf(stderr, "reopen failed\n");
+        wal_destroy(wal);
+        return 1;
+    }
+
+    printf("[OK] WAL reopened\n");
+    printf("     last_lsn         = %llu\n", (unsigned long long)wal->last_lsn);
+    printf("     last_flushed_lsn = %llu\n", (unsigned long long)wal->last_flushed_lsn);
+    printf("     total_bytes_flushed = %llu\n", (unsigned long long)wal->total_bytes_flushed);
+
+    // 11. Recovery
+    if (!wal_recover(wal)) {
+        fprintf(stderr, "wal_recover failed\n");
+        wal_destroy(wal);
+        return 1;
+    }
+    printf("[OK] wal_recover done\n");
+
+    wal_print_stats(wal);
+
+    wal_destroy(wal);
+
+    printf("\n=== WAL TEST END ===\n");
+    return 0;
+}
+#endif
