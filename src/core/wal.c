@@ -233,6 +233,19 @@ struct wal_checkpoint_payload {
     uint64_t free_memory;     
 };
 
+/*
+ * ideal scenario: records_read = records_applied + records_scipped;
+ * */ 
+struct wal_recovery_stats {
+    uint64_t records_read;
+    uint64_t records_applied;
+    uint64_t records_scipped;
+    uint64_t last_valid_lsn;
+    uint64_t bytes_read;
+    uint64_t current_offset;
+    _Bool    stopped_early;
+};
+
 // Отдельная структура для каждого типа записи
 struct wal_record_alloc {
     struct wal_record_header header;
@@ -280,6 +293,8 @@ struct wal_buffer {
     pthread_mutex_t buffer_lock;
 };
 
+_Bool (*wal_replay_fn)(void *user_ctx, const struct wal_record_header *hdr, const void *payload, uint32_t payload_size);
+
 struct wal_context {
     char *wal_file_path;  
     int wal_file_fd;
@@ -312,8 +327,10 @@ struct wal_context {
     // Callbacks
     void (*on_flush)(void *ctx);           // Called after flush
     void (*on_checkpoint)(void *ctx);      // Called after checkpoint
-    void (*on_recovery)(void *ctx);        // Called during recovery
     void *callback_ctx;                     // Context for callbacks
+    
+    wal_replay_fn wal_replay;
+    void *replay_ctx;
 
     // Recovery state
     _Bool in_recovery;            // Is recovery in progress
@@ -1027,6 +1044,31 @@ _Bool wal_checkpoint(struct wal_context *ctx, _Bool flush_first) {
     return true;
 }
 
+/*
+ *  > 0 - RECORD SIZE 
+ *  0 - END OF FILE 
+ *  -1 - READ ERROR 
+ *  -2 - CORRUPTED RECORDING 
+ *  -3 - THE RECORDING IS TRUNCATED
+ * */
+static int wal__read_record(int fd, off_t offset, struct wal_record_header *out_header, void *out_payload, uint32_t out_payload_capacity) {
+    if (!out_header) return -1;
+
+    struct wal_record_header record_header;
+    memset(&record_header, 0, sizeof(record_header));
+    
+    ssize_t n = pread(fd, &record_header, sizeof(record_header), offset);
+
+    if (n == ) {
+    
+  
+        
+  }
+}
+
+/*
+  * Recovery stops at the first bit‑rot record — beyond that, it’s garbage.  (!) Save the garbage in seperate file (this may contain important information)
+  * * */
 _Bool wal_recovery(struct wal_context *ctx) {
     if (!ctx || !ctx->is_open) return false;
     
