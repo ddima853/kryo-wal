@@ -538,23 +538,6 @@ struct wal_context *wal_init(const char *wal_file_path) {
 
     struct wal_context *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
-        fprintf(stderr, "WAL: Failed to allocate context\n");
-        return NULL;
-    }
-
-    ctx->wal_file_path = strdup(wal_file_path);
-    if (!ctx->wal_file_path) {
-        fprintf(stderr, "WAL: Failed to allocate file path\n");
-        free(ctx);
-        return NULL;
-    }
-    
-    ctx->buffer.buffer_size = WAL_DEFAULT_FILE_SIZE;
-    ctx->buffer.buffer = calloc(1, ctx->buffer.buffer_size);
-    if (!ctx->buffer.buffer) {
-        fprintf(stderr, "WAL: Failed to allocate buffer\n");
-        free(ctx->wal_file_path);
-        free(ctx);
         return NULL;
     }
 
@@ -587,6 +570,7 @@ _Bool wal_open(struct wal_context *ctx) {
     /*
     specifies that the file owner has read and write permissions, while the group and others have read-only permissions
     */
+    
     ctx->wal_file_fd = open(ctx->wal_file_path, O_RDWR | O_CREAT, 0644);
     if (ctx->wal_file_fd < 0) {
         fprintf(stderr, "WAL: Failed to open file: %s (errno=%d)\n", 
@@ -639,6 +623,23 @@ _Bool wal_open(struct wal_context *ctx) {
         ctx->last_checkpoint_lsn = header.last_checkpoint_lsn;
         ctx->buffer.current_offset = sizeof(struct wal_header);
 
+        // ВАЖНО: без этих двух строк первый flush запишет данные поверх старых
+        ctx->total_bytes_flushed = (uint64_t)st.st_size - sizeof(struct wal_header);
+        ctx->last_flushed_lsn = header.last_lsn;
+    } else {
+        struct wal_header header;
+        memset(&header, 0, sizeof(header));
+
+        header.magic = WAL_MAGIC_NUMBER;
+        header.version = WAL_VERSION;
+        header.last_lsn = 0;
+        header.last_checkpoint_lsn = 0;
+        header.last_checkpoint_time = get_timestamp();
+        header.page_size = WAL_PAGE_SIZE;
+        header.record_count = 0;
+        header.checksum = 0;
+        header.flags = 0;
+        
         // ВАЖНО: без этих двух строк первый flush запишет данные поверх старых
         ctx->total_bytes_flushed = (uint64_t)st.st_size - sizeof(struct wal_header);
         ctx->last_flushed_lsn = header.last_lsn;
@@ -1051,19 +1052,80 @@ _Bool wal_checkpoint(struct wal_context *ctx, _Bool flush_first) {
  *  -2 - CORRUPTED RECORDING 
  *  -3 - THE RECORDING IS TRUNCATED
  * */
-static int wal__read_record(int fd, off_t offset, struct wal_record_header *out_header, void *out_payload, uint32_t out_payload_capacity) {
+static int wal__read_record(int fd, off_t offset,
+                            struct wal_record_header *out_header,
+                            void *out_payload,
+                            uint32_t out_payload_capacity) {
     if (!out_header) return -1;
 
     struct wal_record_header record_header;
     memset(&record_header, 0, sizeof(record_header));
-    
+
     ssize_t n = pread(fd, &record_header, sizeof(record_header), offset);
 
-    if (n == ) {
-    
-  
-        
-  }
+    if (n == 0) {
+        return 0;
+    }
+    if (n < 0) {
+        return -1;
+    }
+    if ((size_t)n < sizeof(record_header)) {
+        return -3;
+    }
+
+    if (record_header.record_size < sizeof(struct wal_record_header)) {
+        return -2;
+    }
+    if (record_header.record_size > (uint32_t)WAL_MAX_RECORD_SIZE) {
+        return -2;
+    }
+    if (record_header.record_size != sizeof(struct wal_record_header) + record_header.data_size) {
+        return -2;
+    }
+    if (record_header.record_type < WAL_RECORD_ALLOC ||
+        record_header.record_type > WAL_RECORD_METADATA_UPDATE) {
+        return -2;
+    }
+
+    if (out_payload && record_header.data_size > 0) {
+        if (record_header.data_size > out_payload_capacity) {
+            return -2;
+        }
+        ssize_t pn = pread(fd, out_payload, record_header.data_size,
+                           offset + sizeof(struct wal_record_header));
+        if (pn < 0) {
+            return -1;
+        }
+        if ((size_t)pn < record_header.data_size) {
+            return -3;
+        }
+    }
+
+    uint8_t *record_buf = calloc(1, record_header.record_size);
+    if (!record_buf) {
+        return -1;
+    }
+
+    ssize_t rn = pread(fd, record_buf, record_header.record_size, offset);
+    if (rn < 0 || (size_t)rn < record_header.record_size) {
+        free(record_buf);
+        return (rn < 0) ? -1 : -3;
+    }
+
+    struct wal_record_header *hdr_in_buf = (struct wal_record_header *)record_buf;
+    uint32_t saved_crc = hdr_in_buf->crc32;
+    hdr_in_buf->crc32 = 0;
+
+    uint32_t computed_crc = crc32_calculate(record_buf, record_header.record_size);
+    hdr_in_buf->crc32 = saved_crc;
+    free(record_buf);
+
+    if (computed_crc != saved_crc) {
+        return -2;
+    }
+
+    *out_header = record_header;
+    return (int)record_header.record_size;
 }
 
 /*
@@ -1178,48 +1240,6 @@ void wal_print_stats(struct wal_context *ctx) {
            (unsigned long long)ctx->total_bytes_written);
     printf("Total Flushes: %llu\n", 
            (unsigned long long)ctx->total_flushes);
-    printf("Total Sync Flushes: %llu\n", 
-           (unsigned long long)ctx->total_sync_flushed);
-    printf("Total Checkpoints: %llu\n", 
-           (unsigned long long)ctx->total_checkpoints);
-    printf("Recovery Errors: %u\n", ctx->recovery_errors);
-    
-    pthread_mutex_unlock(&ctx->wal_lock);
-}
-
-// ====================== TEST MAIN ======================
-#ifdef WAL_TEST
-int main(void) {
-    const char *path = "/tmp/test_wal.log";
-
-    // Удаляем старый файл, чтобы тест был чистым
-    unlink(path);
-
-    printf("=== WAL TEST START ===\n\n");
-
-    // 1. Инициализация
-    struct wal_context *wal = wal_init(path);
-    if (!wal) {
-        fprintf(stderr, "wal_init failed\n");
-        return 1;
-    }
-
-    // 2. Открытие
-    if (!wal_open(wal)) {
-        fprintf(stderr, "wal_open failed\n");
-        wal_destroy(wal);
-        return 1;
-    }
-
-    printf("[OK] WAL opened: %s\n\n", path);
-
-    // 3. Запись alloc
-    void *fake_ptr1 = (void *)0x1000;
-    void *fake_ptr2 = (void *)0x2000;
-
-    uint64_t lsn1 = wal_write_alloc(wal, fake_ptr1, fake_ptr1, 1, 32, 0);
-    printf("[OK] wal_write_alloc #1 -> LSN %llu\n", (unsigned long long)lsn1);
-
     uint64_t lsn2 = wal_write_alloc(wal, fake_ptr2, fake_ptr2, 1, 64, 1);
     printf("[OK] wal_write_alloc #2 -> LSN %llu\n", (unsigned long long)lsn2);
 
