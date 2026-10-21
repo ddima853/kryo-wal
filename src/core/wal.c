@@ -234,12 +234,12 @@ struct wal_checkpoint_payload {
 };
 
 /*
- * ideal scenario: records_read = records_applied + records_scipped;
+ * ideal scenario: records_read = records_applied + records_skipped;
  * */ 
 struct wal_recovery_stats {
     uint64_t records_read;
     uint64_t records_applied;
-    uint64_t records_scipped;
+    uint64_t records_skipped;
     uint64_t last_valid_lsn;
     uint64_t bytes_read;
     uint64_t current_offset;
@@ -293,8 +293,6 @@ struct wal_buffer {
     pthread_mutex_t buffer_lock;
 };
 
-_Bool (*wal_replay_fn)(void *user_ctx, const struct wal_record_header *hdr, const void *payload, uint32_t payload_size);
-
 struct wal_context {
     char *wal_file_path;  
     int wal_file_fd;
@@ -328,8 +326,11 @@ struct wal_context {
     void (*on_flush)(void *ctx);           // Called after flush
     void (*on_checkpoint)(void *ctx);      // Called after checkpoint
     void *callback_ctx;                     // Context for callbacks
-    
-    wal_replay_fn wal_replay;
+
+    _Bool (*wal_replay)(void *user_ctx,
+                        const struct wal_record_header *hdr,
+                        const void *payload,
+                        uint32_t payload_size);
     void *replay_ctx;
 
     // Recovery state
@@ -504,8 +505,8 @@ crc >> 8 = 0x00FFFFFF
 static uint64_t get_timestamp(void) {
     /*
     struct timespec {
-           time_t     tv_sec;   /* Seconds  
-           /* ...   tv_nsec;  /* Nanoseconds [0, 999'999'999]  
+           time_t     tv_sec;   // Seconds
+           long       tv_nsec;  // Nanoseconds [0, 999'999'999]
        };
     */
     struct timespec ts;
@@ -1162,7 +1163,11 @@ _Bool wal_recovery(struct wal_context *ctx) {
 
 	int fd = ctx->wal_file_fd;
 	uint64_t checkpoint_lsn = ctx->last_checkpoint_lsn;
-	wal_replay_fn replay_fn = ctx->wal_replay;
+
+	_Bool (*replay_fn)(void *user_ctx,
+	                   const struct wal_record_header *hdr,
+	                   const void *payload,
+	                   uint32_t payload_size) = ctx->wal_replay;
 	void *replay_ctx = ctx->replay_ctx;
 
 	pthread_mutex_unlock(&ctx->wal_lock);
