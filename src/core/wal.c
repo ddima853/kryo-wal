@@ -570,7 +570,6 @@ _Bool wal_open(struct wal_context *ctx) {
     /*
     specifies that the file owner has read and write permissions, while the group and others have read-only permissions
     */
-    
     ctx->wal_file_fd = open(ctx->wal_file_path, O_RDWR | O_CREAT, 0644);
     if (ctx->wal_file_fd < 0) {
         fprintf(stderr, "WAL: Failed to open file: %s (errno=%d)\n", 
@@ -639,6 +638,7 @@ _Bool wal_open(struct wal_context *ctx) {
         header.record_count = 0;
         header.checksum = 0;
         header.flags = 0;
+        
         
         // ВАЖНО: без этих двух строк первый flush запишет данные поверх старых
         ctx->total_bytes_flushed = (uint64_t)st.st_size - sizeof(struct wal_header);
@@ -1128,118 +1128,148 @@ static int wal__read_record(int fd, off_t offset,
     return (int)record_header.record_size;
 }
 
-/*
+static _Bool wal__check_sequence(uint64_t prev_lsn, const struct wal_record_header *record_header) {
+	if (prev_lsn == 0) {
+		return record_header->prev_lsn == 0;
+	}
+
+	return record_header->lsn = prev_lsn + 1;
+} 
+
+/*  
   * Recovery stops at the first bit‑rot record — beyond that, it’s garbage.  (!) Save the garbage in seperate file (this may contain important information)
   * * */
 _Bool wal_recovery(struct wal_context *ctx) {
-    if (!ctx || !ctx->is_open) return false;
+    if (!ctx) return false;
     
     pthread_mutex_lock(&ctx->wal_lock);
-    ctx->in_recovery = true;
     
-    printf("WAL: Starting recovery...\n");
+	if (!ctx->is_open || ctx->wal_file_fd < 0) {
+		pthread_mutex_unlock(&ctx->wal_lock);
+		return false;
+	}
 
-    if (ctx->on_recovery) {
-        ctx->on_recovery(ctx->callback_ctx);
-    }
-    
-    // Read header
-    struct wal_header header;
-    ssize_t bytes_read = pread(ctx->wal_file_fd, &header, sizeof(header), 0);
-    
-    if (bytes_read != sizeof(header)) {
-        fprintf(stderr, "WAL: Failed to read header\n");
-        ctx->in_recovery = false;
-        pthread_mutex_unlock(&ctx->wal_lock);
-        return false;
-    }
-    
-    if (header.magic != WAL_MAGIC_NUMBER) {
-        fprintf(stderr, "WAL: Invalid magic number\n");
-        ctx->in_recovery = false;
-        pthread_mutex_unlock(&ctx->wal_lock);
-        return false;
-    }
-    
-    printf("WAL: Last LSN: %llu, Checkpoint LSN: %llu\n",
-           (unsigned long long)header.last_lsn,
-           (unsigned long long)header.last_checkpoint_lsn);
-    
-    ctx->last_lsn = header.last_lsn;
-    ctx->last_checkpoint_lsn = header.last_checkpoint_lsn;
-    
-    ctx->in_recovery = false;
-    pthread_mutex_unlock(&ctx->wal_lock);
-    
-    return true;
+	if (ctx->in_recovery) {
+		pthread_mutex_unlock(&ctx->wal_lock);
+		return false;
+	}
+	ctx->in_recovery = true;
+
+	int fd = ctx->wal_file_fd;
+	uint64_t checkpoint_lsn = ctx->last_checkpoint_lsn;
+	wal_replay_fn replay_fn = ctx->replay_fn;
+	void *replay_ctx = ctx->replay_ctx;
+
+	pthread_mutex_unlock(&ctx->wal_lock);
+
+    printf("WAL: Starting recovery (checkpoint_lsn=%llu)...\n",
+          (unsigned long long)checkpoint_lsn);
+	
+	struct wal_recovery_stats stats;
+	memset(&stats, 0, sizeof(stats));
+
+	uitn8_t *payload_buf = malloc(WAL_MAX_RECORD_SIZE);
+	if (!payload_buf) {
+		pthread_mutex_lock(&ctx->wal_lock);
+		ctx->in_recovery = false;
+		ctx->recovery_errors++;
+		pthread_mutex_unlock(&ctx->wal_lock);
+		return false;
+	}
+
+	off_t offset = sizeof(struct wal_header);
+	uint64_t prev_lsn = 0;
+	_Bool ok = true;
+
+	while (1) {
+		struct wal_record_header record_header;
+		memset(&record_header, 0, sizeof(record_header));
+
+		int result = wal__read_record(fd, offset, &record_header, payload_buf, WAL_MAX_RECORD_SIZE);
+
+		if (result == 0) {
+            printf("WAL: Recovery reached end of file at offset %lld\n",
+                   (long long)offset);
+            break;
+        }
+
+		if (result == -1) {
+            fprintf(stderr, "WAL: Recovery I/O error at offset %lld\n",
+                    (long long)offset);
+            stats.corrupt_offset = (uint64_t)offset;
+            stats.stopped_early = true;
+            ok = false;
+            break;
+        }
+
+		if (result == -2) {
+            fprintf(stderr, "WAL: Corrupt record at offset %lld "
+                            "(validation failed)\n",
+                    (long long)offset);
+            stats.corrupt_offset = (uint64_t)offset;
+            stats.stopped_early = true;
+            break;
+        }
+
+		uint32_t record_size = (uint32_t)result;
+
+        if (!wal__check_sequence(prev_lsn, &hdr)) {
+            fprintf(stderr, "WAL: LSN sequence broken at offset %lld "
+                            "(expected prev_lsn=%llu, got lsn=%llu, prev=%llu)\n",
+                    (long long)offset,
+                    (unsigned long long)prev_lsn,
+                    (unsigned long long)record_header.lsn,
+                    (unsigned long long)record_header.prev_lsn);
+            stats.corrupt_offset = (uint64_t)offset;
+            stats.stopped_early = true;
+            break;
+        }
+
+		stats.records_read++;
+        stats.bytes_read += record_size;
+        stats.last_valid_lsn = record_header.lsn;
+        prev_lsn = record_header.lsn;
+
+		if (record_header.lsn <= checkpoint_lsn) {
+            stats.records_skipped++;
+            offset += record_size;
+            continue;
+        }
+
+		stats.records_applied++;
+
+		offset += record_size;
+	}
+
+	free(payload_buf);
+
+	pthread_mutex_lock(&ctx->wal_lock);
+
+	if (stats.last_valid_lsn > 0) {
+		ctx->last_lsn = stats.last_valid_lsn;
+		ctx->buffer.current_offset = sizeof(struct wal_header);
+	}
+
+	ctx->in_recovery = false;
+	if (!ok) {
+		ctx->recovery_errors++;
+	}
+
+	pthread_mutex_unlock(&ctx->wal_lock);
+
+	printf("WAL: Recovery done. read=%llu applied=%llu skipped=%llu "
+           "last_lsn=%llu stopped_early=%s\n",
+           (unsigned long long)stats.records_read,
+           (unsigned long long)stats.records_applied,
+           (unsigned long long)stats.records_skipped,
+           (unsigned long long)stats.last_valid_lsn,
+           stats.stopped_early ? "yes" : "no");
+
+	return ok;
 }
 
 void wal_close(struct wal_context *ctx) {
     if (!ctx) return;
-    
-    pthread_mutex_lock(&ctx->wal_lock);
-    
-    if (ctx->is_open) {
-        // БЕЗ deadlock — используем locked-версию
-        wal__flush_sync_locked(ctx);
-        
-        // Update header
-        struct wal_header header;
-        memset(&header, 0, sizeof(header));
-        
-        header.magic = WAL_MAGIC_NUMBER;
-        header.version = WAL_VERSION;
-        header.last_lsn = ctx->last_lsn;
-        header.last_checkpoint_lsn = ctx->last_checkpoint_lsn;
-        header.last_checkpoint_time = get_timestamp();
-        header.page_size = WAL_PAGE_SIZE;
-        header.record_count = ctx->total_records_written;
-        header.flags = 0;
-        
-        pwrite(ctx->wal_file_fd, &header, sizeof(header), 0);
-        fsync(ctx->wal_file_fd);
-        
-        close(ctx->wal_file_fd);
-        ctx->wal_file_fd = -1;
-        ctx->is_open = false;
-    }
-    
-    pthread_mutex_unlock(&ctx->wal_lock);
-}
-
-void wal_destroy(struct wal_context *ctx) {
-    if (!ctx) return;
-    
-    wal_close(ctx);
-    
-    pthread_mutex_destroy(&ctx->wal_lock);
-    pthread_mutex_destroy(&ctx->buffer.buffer_lock);
-    pthread_cond_destroy(&ctx->flush_cond);
-    
-    free(ctx->buffer.buffer);
-    free(ctx->wal_file_path);
-    free(ctx);
-}
-
-void wal_print_stats(struct wal_context *ctx) {
-    if (!ctx) return;
-    
-    pthread_mutex_lock(&ctx->wal_lock);
-    
-    printf("\n=== WAL Statistics ===\n");
-    printf("File: %s\n", ctx->wal_file_path);
-    printf("Open: %s\n", ctx->is_open ? "Yes" : "No");
-    printf("Last LSN: %llu\n", (unsigned long long)ctx->last_lsn);
-    printf("Last Flushed LSN: %llu\n", (unsigned long long)ctx->last_flushed_lsn);
-    printf("Last Checkpoint LSN: %llu\n", (unsigned long long)ctx->last_checkpoint_lsn);
-    printf("Buffer Used: %zu / %zu bytes\n", 
-           ctx->buffer.current_offset, ctx->buffer.buffer_size);
-    printf("Total Records Written: %llu\n", 
-           (unsigned long long)ctx->total_records_written);
-    printf("Total Bytes Written: %llu\n", 
-           (unsigned long long)ctx->total_bytes_written);
-    printf("Total Flushes: %llu\n", 
-           (unsigned long long)ctx->total_flushes);
     uint64_t lsn2 = wal_write_alloc(wal, fake_ptr2, fake_ptr2, 1, 64, 1);
     printf("[OK] wal_write_alloc #2 -> LSN %llu\n", (unsigned long long)lsn2);
 
